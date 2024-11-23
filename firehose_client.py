@@ -1,16 +1,22 @@
 # /// script
 # dependencies = [
-#   "aiofiles>=23.2.1",
-#   "tqdm>=4.66.1",
-#   "atproto>=0.0.44",
-#   "types-tqdm>=4.66.0.20240106",
-#   "types-aiofiles>=23.2.0.20240106",
+#    "aioboto3>=13.2.0",
+#    "aiofiles>=24.1.0",
+#    "atproto>=0.0.55",
+#    "mypy>=1.13.0",
+#    "ruff>=0.8.0",
+#    "tqdm>=4.67.0",
+#    "types-aiofiles>=24.1.0.20240626",
+#    "types-boto3>=1.0.2",
+#    "types-tqdm>=4.67.0.20241119"
 # ]
 # ///
 
 # This script listens on the BlueSky ATProto Firehose and saves all events to jsonl files, gzip compressed.
+# You can choose to store the files on S3, or on the local filesystem.
+# For S3, this script assumes you are running on AWS infrastructure with a valid IAM role.
 # Run using `uv run firehose_cache.py`
-# Adds an `__actor` key with the message's actor
+# Note: Each JSON object contains a non-standard `__actor` key with the message's actor
 
 import json
 import asyncio
@@ -24,13 +30,28 @@ import sys
 from types import FrameType
 
 import aiofiles
+import aioboto3  # type: ignore
+import boto3
+from boto3.session import Session as Boto3Session
+from aioboto3.session import Session as AioBoto3Session  # type: ignore
+from botocore.credentials import Credentials
+from botocore.config import Config
 from atproto import FirehoseSubscribeReposClient, parse_subscribe_repos_message  # type: ignore
 from atproto import CAR, models  # type: ignore
 from atproto_client.models.utils import get_or_create  # type: ignore
 
 # Configuration constants
 RECORDS_PER_FILE: int = 1_000_000  # Number of records before creating a new file
-PROGRESS_UPDATE_FREQUENCY: int = 10  # How often to update the progress bar
+PROGRESS_UPDATE_FREQUENCY: int = 100  # How often to update the progress bar
+
+# S3 Configuration
+USE_S3: bool = True  # Set to False to use local file system
+S3_BUCKET: str = "YOUR_BUCKET"  # Set your AWS Bucket here
+S3_PREFIX: str = "YOUR_PREFIX/"  # Prefix for S3 objects, must end with /
+AWS_REGION: str = "YOUR_REGION"  # Set your AWS region here
+
+# Configure AWS SDK settings
+boto_config = Config(region_name=AWS_REGION, retries=dict(max_attempts=3))
 
 
 class JSONExtra(json.JSONEncoder):
@@ -44,14 +65,33 @@ class JSONExtra(json.JSONEncoder):
 class AsyncFirehoseProcessor:
     def __init__(self, output_dir: str = "data") -> None:
         self.output_dir: Path = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+        if not USE_S3:
+            self.output_dir.mkdir(exist_ok=True)
         self.records: List[Dict[str, Any]] = []
         self.client: FirehoseSubscribeReposClient = FirehoseSubscribeReposClient()
         self.save_lock: asyncio.Lock = asyncio.Lock()
-        self.pbar: Optional[tqdm[Any]] = None
+        self.pbar: tqdm[Any] | None = None
         self.total_processed: int = 0
         self.running: bool = True
         self.json_encoder = JSONExtra()
+        self.s3_session: AioBoto3Session | None = None
+
+        # Initialize s3_session based on USE_S3 flag
+        if USE_S3:
+            session: Boto3Session = boto3.Session(region_name=AWS_REGION)
+            credentials: Credentials | None = session.get_credentials()
+
+            if credentials is None:
+                raise RuntimeError("Unable to obtain AWS credentials")
+
+            self.s3_session = aioboto3.Session(
+                region_name=AWS_REGION,
+                aws_access_key_id=credentials.access_key,
+                aws_secret_access_key=credentials.secret_key,
+                aws_session_token=credentials.token,
+            )
+        else:
+            self.s3_session = None
 
     def _setup_progress_bar(self) -> None:
         """Initialize or reset the progress bar"""
@@ -63,18 +103,38 @@ class AsyncFirehoseProcessor:
             unit="records",
         )
         # Reset count for new file
-        if self.pbar is not None:  # Make mypy happy
+        if self.pbar is not None:
             self.pbar.n = len(self.records)
             self.pbar.refresh()
 
+    async def _save_to_s3(self, compressed_data: bytes, filename: str) -> str:
+        """Save compressed data to S3"""
+        s3_key = f"{S3_PREFIX}{filename}"
+        if self.s3_session:
+            async with self.s3_session.client("s3") as s3:
+                await s3.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key,
+                    Body=compressed_data,
+                    ContentType="application/gzip",
+                )
+            return f"s3://{S3_BUCKET}/{s3_key}"
+        return ""
+
+    async def _save_to_local(self, compressed_data: bytes, filename: Path) -> str:
+        """Save compressed data to local filesystem"""
+        async with aiofiles.open(filename, "wb") as f:
+            await f.write(compressed_data)
+        return str(filename.absolute())
+
     async def save_records(self) -> None:
-        """Save records to a gzipped JSONL file asynchronously"""
+        """Save records to a gzipped JSONL file either on S3 or locally"""
         if not self.records:
             return
 
         async with self.save_lock:
             timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename: Path = self.output_dir / f"bluesky_records_{timestamp}.jsonl.gz"
+            filename = f"bluesky_records_{timestamp}.jsonl.gz"
 
             try:
                 # Create a copy of records and clear the original list
@@ -90,13 +150,16 @@ class AsyncFirehoseProcessor:
                 # Compress the JSONL data
                 compressed_data: bytes = gzip.compress(json_bytes)
 
-                # Write the compressed data
-                async with aiofiles.open(filename, "wb") as f:
-                    await f.write(compressed_data)
+                # Save either to S3 or locally
+                if USE_S3:
+                    save_path = await self._save_to_s3(compressed_data, filename)
+                else:
+                    local_path = self.output_dir / filename
+                    save_path = await self._save_to_local(compressed_data, local_path)
 
                 file_size_mb: float = len(compressed_data) / (1024 * 1024)
                 print(
-                    f"\nSaved {len(records_to_save):,} records to {filename} ({file_size_mb:.2f}MB compressed)"
+                    f"\nSaved {len(records_to_save):,} records to {save_path} ({file_size_mb:.2f}MB compressed)"
                 )
 
                 # Update total count and reset progress bar
@@ -182,7 +245,10 @@ class AsyncFirehoseProcessor:
             )
 
             print("Starting Bluesky firehose processor...")
-            print(f"Saving files to: {self.output_dir.absolute()}")
+            if USE_S3:
+                print(f"Saving files to: s3://{S3_BUCKET}/{S3_PREFIX}")
+            else:
+                print(f"Saving files to: {self.output_dir.absolute()}")
             print("Press Ctrl+C to stop gracefully")
 
             # Process messages from queue
