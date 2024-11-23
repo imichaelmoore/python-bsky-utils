@@ -8,7 +8,9 @@
 # ]
 # ///
 
+# This script listens on the BlueSky ATProto Firehose and saves all events to jsonl files, gzip compressed.
 # Run using `uv run firehose_cache.py`
+# Adds an `__actor` key with the message's actor
 
 import json
 import asyncio
@@ -27,8 +29,8 @@ from atproto import CAR, models  # type: ignore
 from atproto_client.models.utils import get_or_create  # type: ignore
 
 # Configuration constants
-RECORDS_PER_FILE: int = 200_000  # Number of records before creating a new file
-PROGRESS_UPDATE_FREQUENCY: int = 100  # How often to update the progress bar
+RECORDS_PER_FILE: int = 1_000_000  # Number of records before creating a new file
+PROGRESS_UPDATE_FREQUENCY: int = 10  # How often to update the progress bar
 
 
 class JSONExtra(json.JSONEncoder):
@@ -49,6 +51,7 @@ class AsyncFirehoseProcessor:
         self.pbar: Optional[tqdm[Any]] = None
         self.total_processed: int = 0
         self.running: bool = True
+        self.json_encoder = JSONExtra()
 
     def _setup_progress_bar(self) -> None:
         """Initialize or reset the progress bar"""
@@ -65,25 +68,26 @@ class AsyncFirehoseProcessor:
             self.pbar.refresh()
 
     async def save_records(self) -> None:
-        """Save records to a gzipped JSON file asynchronously"""
+        """Save records to a gzipped JSONL file asynchronously"""
         if not self.records:
             return
 
         async with self.save_lock:
             timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename: Path = self.output_dir / f"bluesky_records_{timestamp}.json.gz"
+            filename: Path = self.output_dir / f"bluesky_records_{timestamp}.jsonl.gz"
 
             try:
                 # Create a copy of records and clear the original list
                 records_to_save: List[Dict[str, Any]] = self.records.copy()
                 self.records = []
 
-                # Convert to JSON bytes first
-                json_bytes: bytes = json.dumps(records_to_save, cls=JSONExtra).encode(
-                    "utf-8"
+                # Convert each record to JSON and join with newlines
+                jsonl_content = "\n".join(
+                    json.dumps(record, cls=JSONExtra) for record in records_to_save
                 )
+                json_bytes: bytes = jsonl_content.encode("utf-8")
 
-                # Compress the JSON data
+                # Compress the JSONL data
                 compressed_data: bytes = gzip.compress(json_bytes)
 
                 # Write the compressed data
